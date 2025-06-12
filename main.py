@@ -306,4 +306,4 @@ class VoteButton(discord.ui.Button):
         await view.check_votes()
 
 
-bot.run(token)
+bot.run(DISCORD_TOKEN)
