@@ -12,7 +12,7 @@ intents.message_content = True
 intents.members = True
 
 load_dotenv() 
-
+token = os.getenv("DISCORD_TOKEN")
 bot = commands.Bot(command_prefix="&", intents=intents)
 
 RED = 0xFF0000
@@ -306,4 +306,4 @@ class VoteButton(discord.ui.Button):
         await view.check_votes()
 
 
-bot.run(DISCORD_TOKEN)
+bot.run(token)
