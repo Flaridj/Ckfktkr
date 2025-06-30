@@ -1,309 +1,251 @@
 import discord
 from discord.ext import commands
-import random
-import string
+import datetime
 import asyncio
-from datetime import datetime
-from dotenv import load_dotenv
 import os
+from dotenv import load_dotenv
+load_dotenv()
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.voice_states = True
 
-load_dotenv() 
-token = os.getenv("DISCORD_TOKEN")
 bot = commands.Bot(command_prefix="&", intents=intents)
 
-RED = 0xFF0000
-FOOTER_TEXT = "Loup Garou By Nyr"
-FOOTER_ICON = None
-EMBED_IMAGE_URL = "https://cdn.discordapp.com/attachments/1381995165794701323/1382005101576847451/IMG_0675.webp?ex=6849940c&is=6848428c&hm=08fd1472afc209aca86d38035ec06d12939c5717a6ee09c012ee76a3a658d4ab"
+OWNER_ID = 1254402109563076722  # ta clé ne change pas
+whitelist = {OWNER_ID, 550057085849567239}
 
-OWNER_ID = 1254402109563076722
+missions = {}   # guild_id -> Mission
+scores = {}     # guild_id -> {user_id: {"count":int,"total_time":float}}
+mission_tasks = {}  # guild_id -> asyncio.Task
 
-ROLES_BASE = [
-    "Loup-garou", "Loup-garou",  # 2 loups
-    "Voyante",
-    "Sorcière",
-    "Chasseur",
-    "Villageois"
-]
+def convert_to_seconds(qty, unit):
+    unit = unit.lower()
+    if unit == "s":
+        return qty
+    if unit == "m":
+        return qty * 60
+    if unit == "h":
+        return qty * 3600
+    return None
 
-games = {}  # channel_id -> Game
-
-
-def generate_code(length=6):
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=length))
-
-
-class Player:
-    def __init__(self, member):
-        self.member = member
-        self.role = None
-        self.ready = False
-        self.alive = True
-        self.vote = None
-
-
-class Game:
-    def __init__(self, channel, creator):
+class Mission:
+    def __init__(self, guild, role, quota_vocal_s, quota_msg, temps_max_s,
+                 role1, role2, channel, role_no_eligible1=None, role_no_eligible2=None):
+        self.guild = guild
+        self.role = role
+        self.quota_vocal_s = quota_vocal_s
+        self.quota_msg = quota_msg
+        self.temps_max_s = temps_max_s
+        self.role1 = role1
+        self.role2 = role2
         self.channel = channel
-        self.creator = creator  # stocke l'auteur de &create
-        self.code = generate_code()
-        self.players = []
-        self.started = False
-        self.phase = "waiting"  # waiting, night, day, ended
-        self.night_actions = {}
+        self.role_no_eligible1 = role_no_eligible1
+        self.role_no_eligible2 = role_no_eligible2
+        self.start_time = datetime.datetime.utcnow()
+        self.finished_members = set()
+        self.vocal_times = {}
+        self.msg_counts = {}
+        self.user_vocal_start = {}
+        self.embed_message = None
 
-    def assign_roles(self):
-        n = len(self.players)
-        roles = ROLES_BASE.copy()
-        if n > len(roles):
-            roles += ["Villageois"] * (n - len(roles))
-        else:
-            roles = roles[:n]
-        random.shuffle(roles)
-        for i, player in enumerate(self.players):
-            player.role = roles[i]
+    def time_left(self):
+        elapsed = (datetime.datetime.utcnow() - self.start_time).total_seconds()
+        return max(0, int(self.temps_max_s - elapsed))
 
-    def all_ready(self):
-        return all(p.ready for p in self.players if p.alive)
+    def has_ended(self):
+        return self.time_left() <= 0
 
+    def is_eligible(self, member):
+        if self.role_no_eligible1 and self.role_no_eligible1 in member.roles:
+            return False
+        if self.role_no_eligible2 and self.role_no_eligible2 in member.roles:
+            return False
+        return True
 
-async def send_embed(channel, title="", description="", color=RED):
-    embed = discord.Embed(title=title, description=description, color=color)
-    embed.set_footer(text=FOOTER_TEXT, icon_url=FOOTER_ICON)
-    embed.set_image(url=EMBED_IMAGE_URL)
-    await channel.send(embed=embed)
+async def start_mission_loop(guild_id):
+    mission = missions[guild_id]
+    channel = mission.channel
 
+    while True:
+        # update finish status for all members
+        for member in mission.role.members:
+            if mission.is_eligible(member):
+                await check_finish(member, mission)
 
-@bot.command()
-async def create(ctx):
-    if ctx.channel.id in games and games[ctx.channel.id].phase != "ended":
-        await send_embed(ctx.channel, title="Erreur", description="Une partie est déjà en cours dans ce salon.")
-        return
-    game = Game(ctx.channel, ctx.author)
-    games[ctx.channel.id] = game
-    await send_embed(ctx.channel,
-                     title="Nouvelle partie créée",
-                     description=f"Code de la partie : `{game.code}`\nPour rejoindre, faites `&join {game.code}`.\n"
-                                 f"Seul {ctx.author.name} peut lancer la partie avec `&start`.")
+        # build embed
+        time_left = mission.time_left()
+        count_finished = len(mission.finished_members)
+        total = sum(1 for m in mission.role.members if mission.is_eligible(m))
 
-
-@bot.command()
-async def join(ctx, code: str):
-    game = next((g for g in games.values() if g.code == code and not g.started), None)
-    if not game:
-        await send_embed(ctx.channel, title="Erreur", description="Partie introuvable ou déjà démarrée.")
-        return
-    if any(p.member.id == ctx.author.id for p in game.players):
-        await send_embed(ctx.channel, title="Erreur", description="Vous êtes déjà inscrit dans cette partie.")
-        return
-    game.players.append(Player(ctx.author))
-    await send_embed(ctx.channel,
-                     title="Nouveau joueur",
-                     description=f"{ctx.author.name} a rejoint la partie ! ({len(game.players)} joueurs)")
-
-
-@bot.command()
-async def start(ctx):
-    game = games.get(ctx.channel.id)
-    if not game:
-        await send_embed(ctx.channel, title="Erreur", description="Aucune partie créée dans ce salon.")
-        return
-
-    if ctx.author.id != game.creator.id:
-        await send_embed(ctx.channel, title="Erreur", description="Seul le créateur de la partie peut la lancer.")
-        return
-
-    if game.started:
-        await send_embed(ctx.channel, title="Erreur", description="La partie a déjà démarré.")
-        return
-
-    if len(game.players) < 2:
-        await send_embed(ctx.channel, title="Erreur", description="Il faut au moins 2 joueurs pour commencer.")
-        return
-
-    game.started = True
-    game.assign_roles()
-
-    embed = discord.Embed(
-        title="La partie démarre !",
-        description="Cliquez sur le bouton ci-dessous pour voir votre rôle.",
-        color=RED
-    )
-    embed.set_footer(text=FOOTER_TEXT)
-    embed.set_image(url=EMBED_IMAGE_URL)
-    await ctx.channel.send(embed=embed)
-
-    for p in game.players:
-        embed_player = discord.Embed(
-            title="Révélation du rôle",
-            description=f"{p.member.name}, cliquez sur le bouton ci-dessous pour découvrir votre rôle.",
-            color=RED
+        embed = discord.Embed(
+            title="🍥 Suivi de la mission",
+            description=(
+                f"👥 Membres ayant fini : **{count_finished}/{total}**\n"
+                f"⏳ Temps restant : **{str(datetime.timedelta(seconds=time_left))}**"
+            ),
+            color=0xFFA500
         )
-        embed_player.set_footer(text=FOOTER_TEXT)
-        embed_player.set_image(url=EMBED_IMAGE_URL)
-        await ctx.channel.send(embed=embed_player, view=RoleRevealButton(p, game))
 
+        try:
+            if mission.embed_message is None:
+                msg = await channel.send(embed=embed)
+                mission.embed_message = msg
+            else:
+                await mission.embed_message.edit(embed=embed)
+        except Exception as e:
+            print("❌ Erreur embed:", e)
+
+        if mission.has_ended():
+            await channel.send(f"🍙 Fin de la mission pour le rôle {mission.role.name}")
+            missions.pop(guild_id, None)
+            mission_tasks.pop(guild_id, None)
+            break
+
+        await asyncio.sleep(3)
 
 @bot.event
 async def on_ready():
-    print(f"Bot connecté comme {bot.user}")
+    await bot.tree.sync()
+    print(f"✅ Connecté en tant que {bot.user}")
 
+@bot.tree.command(name="mission", description="Lancer une mission pour un rôle donné")
+@discord.app_commands.describe(
+    role="Rôle à surveiller",
+    quota_vocal="Durée vocale requise (1-50)",
+    unit_vocal="Unité (s,m,h)",
+    quota_msg="Nombre de messages requis (1-50)",
+    temps_max="Temps max",
+    unit_max="Unité (s,m,h)",
+    role1="Rôle 1 si réussi",
+    role2="Rôle 2 si réussi",
+    role_no_eligible1="Rôle non éligible 1 (opt.)",
+    role_no_eligible2="Rôle non éligible 2 (opt.)"
+)
+async def mission(
+    interaction: discord.Interaction,
+    role: discord.Role,
+    quota_vocal: int,
+    unit_vocal: str,
+    quota_msg: int,
+    temps_max: int,
+    unit_max: str,
+    role1: discord.Role,
+    role2: discord.Role,
+    role_no_eligible1: discord.Role=None,
+    role_no_eligible2: discord.Role=None
+):
+    if interaction.user.id not in whitelist:
+        return await interaction.response.send_message("❌ t pas autorisé", ephemeral=True)
+    if not (1<=quota_vocal<=50 and 1<=quota_msg<=50):
+        return await interaction.response.send_message("⚠️ quotas 1 à 50", ephemeral=True)
 
-class RoleRevealButton(discord.ui.View):
-    def __init__(self, player: Player, game: Game):
-        super().__init__(timeout=None)
-        self.player = player
-        self.game = game
+    qv = convert_to_seconds(quota_vocal, unit_vocal)
+    tm = convert_to_seconds(temps_max, unit_max)
+    if qv is None or tm is None:
+        return await interaction.response.send_message("⚠️ unités s,m ou h", ephemeral=True)
 
-    @discord.ui.button(label="Voir mon rôle", style=discord.ButtonStyle.blurple)
-    async def reveal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.player.member.id:
-            await interaction.response.send_message("Ce bouton n'est pas pour vous.", ephemeral=True)
-            return
-        embed = discord.Embed(
-            title="Votre rôle",
-            description=f"Vous êtes **{self.player.role}**.",
-            color=RED
-        )
-        embed.set_footer(text=FOOTER_TEXT)
-        embed.set_image(url=EMBED_IMAGE_URL)
-        self.player.ready = True
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    m = Mission(interaction.guild, role, qv, quota_msg, tm,
+                role1, role2, interaction.channel,
+                role_no_eligible1, role_no_eligible2)
+    missions[interaction.guild.id] = m
 
-        if self.game.all_ready():
-            await send_embed(self.game.channel,
-                             title="Tous les joueurs sont prêts ! La nuit tombe...")
-            await start_night_phase(self.game)
+    embed = discord.Embed(
+        title="🏯 Mission lancée",
+        description=(
+            f"Role surv : **{role.name}**\n"
+            f"🎧 vocal : {quota_vocal}{unit_vocal}\n"
+            f"💬 msg : {quota_msg}\n"
+            f"⏱️ max : {temps_max}{unit_max}\n"
+            f"🏆 gains : {role1.name} , {role2.name}"
+        ),
+        color=0xFFA500
+    )
+    no_text=""
+    if role_no_eligible1: no_text+=f"🚫 non élig : {role_no_eligible1.name}\n"
+    if role_no_eligible2: no_text+=f"🚫 non élig : {role_no_eligible2.name}\n"
+    if no_text: embed.add_field(name="⚠️ exclu", value=no_text, inline=False)
 
+    await interaction.response.send_message(embed=embed)
 
-async def start_night_phase(game: Game):
-    game.phase = "night"
-    game.night_actions = {}
-    loups = [p for p in game.players if p.role == "Loup-garou" and p.alive]
-    if not loups:
-        await send_embed(game.channel,
-                         title="Fin de partie",
-                         description="Pas de loups-garous vivants, la partie est terminée.")
-        game.phase = "ended"
+    task = asyncio.create_task(start_mission_loop(interaction.guild.id))
+    mission_tasks[interaction.guild.id] = task
+
+@bot.event
+async def on_voice_state_update(member, before, after):
+    m = missions.get(member.guild.id)
+    if not m or member not in m.role.members or not m.is_eligible(member):
         return
-    await send_embed(game.channel,
-                     title="Phase de nuit – Loups-garous",
-                     description="Loups-garous, cliquez sur le bouton correspondant pour tuer un joueur.")
 
-    view = KillView(game, loups)
-    await game.channel.send(view=view)
+    uid = member.id
+    if before.channel is None and after.channel is not None:
+        m.user_vocal_start[uid] = datetime.datetime.utcnow()
+    elif before.channel is not None and after.channel is None:
+        start = m.user_vocal_start.pop(uid, None)
+        if start:
+            delta = (datetime.datetime.utcnow() - start).total_seconds()
+            m.vocal_times[uid] = m.vocal_times.get(uid,0)+delta
+            await check_finish(member, m)
 
+@bot.event
+async def on_message(message):
+    if message.author.bot or not message.guild:
+        return
+    m = missions.get(message.guild.id)
+    if not m or message.author not in m.role.members or not m.is_eligible(message.author):
+        return
+    uid=message.author.id
+    m.msg_counts[uid]=m.msg_counts.get(uid,0)+1
+    await check_finish(message.author, m)
 
-class KillView(discord.ui.View):
-    def __init__(self, game: Game, loups: list[Player]):
-        super().__init__(timeout=None)
-        self.game = game
-        self.loups = loups
-        self.killed = None
-        targets = [p for p in game.players if p.alive and p.role != "Loup-garou"]
-        for target in targets:
-            self.add_item(KillButton(target, self))
-        self.votes = {}
+async def check_finish(member, m):
+    uid=member.id
+    if uid in m.finished_members:
+        return
+    v = m.vocal_times.get(uid,0)
+    if uid in m.user_vocal_start:
+        v += (datetime.datetime.utcnow()-m.user_vocal_start[uid]).total_seconds()
+    c = m.msg_counts.get(uid,0)
+    if v>=m.quota_vocal_s and c>=m.quota_msg:
+        m.finished_members.add(uid)
+        try:
+            await member.add_roles(m.role1, m.role2)
+        except: pass
+        # enregistrer score
+        gs = scores.setdefault(m.guild.id,{})
+        data = gs.setdefault(uid,{"count":0,"total_time":0.0})
+        data["count"]+=1
+        data["total_time"]+=(datetime.datetime.utcnow()-m.start_time).total_seconds()
 
-    async def check_votes(self):
-        if len(self.votes) == len(self.loups):
-            count = {}
-            for tgt in self.votes.values():
-                count[tgt] = count.get(tgt, 0) + 1
-            max_votes = max(count.values())
-            max_targets = [t for t, c in count.items() if c == max_votes]
-            self.killed = random.choice(max_targets)
-            self.game.night_actions["kill"] = self.killed
-            self.killed.alive = False
-            await send_embed(self.game.channel,
-                             title="Fin de la nuit",
-                             description=f"Les loups-garous ont tué {self.killed.member.name}.")
-            await start_day_phase(self.game)
-            self.stop()
+@bot.tree.command(name="missiontop", description="classement global missions")
+async def missiontop(interaction: discord.Interaction):
+    gs=scores.get(interaction.guild.id)
+    if not gs:
+        return await interaction.response.send_message("❌ aucun score", ephemeral=True)
+    sorted_ = sorted(gs.items(), key=lambda x:(-x[1]["count"],x[1]["total_time"]))
+    embed=discord.Embed(title="🍙 Top missions",color=0xFFA500)
+    lines=[]
+    for i,(uid,d) in enumerate(sorted_[:10],start=1):
+        u=interaction.guild.get_member(uid)
+        name=u.display_name if u else str(uid)
+        lines.append(f"**{i}.** {name} — 🏯 {d['count']} , ⏳ {int(d['total_time'])}s")
+    embed.description="\n".join(lines)
+    await interaction.response.send_message(embed=embed)
 
-    async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        is_loup = any(l.member.id == interaction.user.id for l in self.loups)
-        if not is_loup:
-            await interaction.response.send_message("Vous n'êtes pas un loup-garou.", ephemeral=True)
-        return is_loup
+@bot.tree.command(name="wl", description="gérer whitelist")
+@discord.app_commands.describe(action="add/remove", user="membre")
+async def wl(interaction: discord.Interaction, action: str, user: discord.Member):
+    if interaction.user.id!=OWNER_ID:
+        return await interaction.response.send_message("❌ t pas owner", ephemeral=True)
+    act=action.lower()
+    if act=="add":
+        whitelist.add(user.id)
+        await interaction.response.send_message(f"✅ {user.display_name} ajouté")
+    elif act=="remove":
+        whitelist.discard(user.id)
+        await interaction.response.send_message(f"✅ {user.display_name} retiré")
+    else:
+        await interaction.response.send_message("❌ add ou remove", ephemeral=True)
 
-    async def on_timeout(self):
-        await send_embed(self.game.channel,
-                         title="Fin de la nuit",
-                         description="Les loups n'ont pas voté à temps, personne n'a été tué.")
-        await start_day_phase(self.game)
-
-
-class KillButton(discord.ui.Button):
-    def __init__(self, target: Player, view: KillView):
-        super().__init__(label=target.member.name, style=discord.ButtonStyle.danger)
-        self.target = target
-        self.view_ref = view
-
-    async def callback(self, interaction: discord.Interaction):
-        self.view_ref.votes[interaction.user.id] = self.target
-        await interaction.response.send_message(f"Vous avez voté pour tuer {self.target.member.name}.", ephemeral=True)
-        await self.view_ref.check_votes()
-
-
-async def start_day_phase(game: Game):
-    game.phase = "day"
-    alive = [p for p in game.players if p.alive]
-
-    await send_embed(game.channel,
-                     title="Phase de jour",
-                     description="Votez pour éliminer un suspect en cliquant sur les boutons ci-dessous.")
-
-    view = VoteView(game)
-    for p in alive:
-        view.add_item(VoteButton(p))
-
-    await game.channel.send(view=view)
-
-
-class VoteView(discord.ui.View):
-    def __init__(self, game: Game):
-        super().__init__(timeout=None)
-        self.game = game
-        self.votes = {}
-
-    async def check_votes(self):
-        alive = [p for p in self.game.players if p.alive]
-        if len(self.votes) == len(alive):
-            count = {}
-            for tgt in self.votes.values():
-                count[tgt] = count.get(tgt, 0) + 1
-            max_votes = max(count.values())
-            max_targets = [t for t, c in count.items() if c == max_votes]
-            eliminated = random.choice(max_targets)
-            eliminated.alive = False
-            await send_embed(self.game.channel,
-                             title="Fin du jour",
-                             description=f"{eliminated.member.name} a été éliminé.")
-            # Vérifier conditions de fin etc ici
-            self.stop()
-
-    async def on_timeout(self):
-        await send_embed(self.game.channel,
-                         title="Fin du jour",
-                         description="Les joueurs n'ont pas voté à temps, personne n'a été éliminé.")
-        self.stop()
-
-
-class VoteButton(discord.ui.Button):
-    def __init__(self, target: Player):
-        super().__init__(label=target.member.name, style=discord.ButtonStyle.secondary)
-        self.target = target
-
-    async def callback(self, interaction: discord.Interaction):
-        view = self.view
-        view.votes[interaction.user.id] = self.target
-        await interaction.response.send_message(f"Vous avez voté pour {self.target.member.name}.", ephemeral=True)
-        await view.check_votes()
-
-
-bot.run(token)
+bot.run(os.getenv("DISCORD_TOKEN"))
